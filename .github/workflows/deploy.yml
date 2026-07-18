@@ -1,0 +1,113 @@
+# cloudflare-proxy-managed-version: 3
+name: Cloudflare Tunnel Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: Public SSH key allowed for proxyuser
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Configure SSH server
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY_SECRET: ${{ secrets.PROXY_SSH_PUBLIC_KEY }}
+          SSH_PUBLIC_KEY_INPUT: ${{ inputs.ssh_public_key }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          if ! id proxyuser >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash proxyuser
+          fi
+          sudo mkdir -p /home/proxyuser/.ssh
+          SSH_PUBLIC_KEY="$SSH_PUBLIC_KEY_SECRET"
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            SSH_PUBLIC_KEY="$SSH_PUBLIC_KEY_INPUT"
+          fi
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo "SSH public key is required"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SSH_PUBLIC_KEY" | grep -Eq '^ssh-(ed25519|rsa) [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
+            echo "SSH public key has an invalid format"
+            exit 1
+          fi
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee /home/proxyuser/.ssh/authorized_keys >/dev/null
+          sudo chown -R proxyuser:proxyuser /home/proxyuser/.ssh
+          sudo chmod 700 /home/proxyuser/.ssh
+          sudo chmod 600 /home/proxyuser/.ssh/authorized_keys
+          sudo passwd -l proxyuser || true
+          sudo tee /etc/ssh/sshd_config.d/99-cloudflare-proxy.conf >/dev/null <<'EOF'
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          AllowTcpForwarding yes
+          GatewayPorts no
+          X11Forwarding no
+          AllowAgentForwarding no
+          EOF
+          sudo /usr/sbin/sshd -t
+          sudo /usr/sbin/sshd
+          sudo cat /etc/ssh/ssh_host_ed25519_key.pub > ssh_host_key.pub
+
+      - name: Start Cloudflare quick tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
+          echo $! > cloudflared.pid
+          mkdir -p tunnel-info
+          TUNNEL_URL=""
+          for i in {1..60}; do
+            TUNNEL_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | tail -n 1 || true)"
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            cat cloudflared.log
+            exit 1
+          fi
+          TUNNEL_HOST="${TUNNEL_URL#https://}"
+          printf '%s\n' "$TUNNEL_HOST" > tunnel-info/host.txt
+          printf '%s\n' "$TUNNEL_URL" > tunnel-info/url.txt
+          cp ssh_host_key.pub tunnel-info/ssh_host_key.pub
+          printf 'Cloudflare tunnel: %s\n' "$TUNNEL_URL"
+          cat cloudflared.log
+
+      - name: Upload tunnel info
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tunnel-info
+          path: tunnel-info/
+
+      - name: Keep proxy alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          while pgrep -f 'cloudflared tunnel --url ssh://localhost:22' >/dev/null && timeout 2 bash -c '</dev/tcp/127.0.0.1/22' 2>/dev/null; do
+            sleep 10
+          done
+          echo "cloudflared or sshd exited unexpectedly"
+          tail -n 200 cloudflared.log || true
+          exit 1
